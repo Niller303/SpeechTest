@@ -83,6 +83,7 @@
       <Private>True</Private>
       <Private>True</Private>
     </Reference>
+    <Reference Include="System.Speech" />
     <Reference Include="System.Web" />
     <Reference Include="System.Xml.Linq" />
     <Reference Include="System.Data" />
@@ -135,7 +136,10 @@
     <Compile Include="MediaPlayer.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="TTS.cs" />
+    <Compile Include="SpeechSynths\DefaultTTS.cs" />
+    <Compile Include="SpeechSynths\MaryTTS.cs" />
+    <Compile Include="SpeechSynths\MozillaTTS.cs" />
+    <Compile Include="SpeechSynths\MSTTS.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />
