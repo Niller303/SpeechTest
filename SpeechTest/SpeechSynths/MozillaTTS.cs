@@ -72,7 +72,7 @@ namespace SpeechTest.SpeechSynths {
 
 		private class MozillaConfig {
 			public string tts_address = "localhost"; //Please dont unless you have a 64 core AMD Epyc Rome cpu thanks
-			public string tts_port = "8080";
+			public string tts_port = "5002";
 		}
 	}
 }
