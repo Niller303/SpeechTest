@@ -18,6 +18,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Web;
 using Newtonsoft.Json;
+using SpeechTest.SpeechSynths;
 
 namespace SpeechTest {
 	class Program {
@@ -25,7 +26,15 @@ namespace SpeechTest {
 		private static Dictionary<string, long> timedout = new Dictionary<string, long>();
 		//UserID, UserMessage
 		private static ConcurrentQueue<ChatMessage> messages = new ConcurrentQueue<ChatMessage>();
+
+		//Application config
 		public static AppConfig config;
+		private static DefaultTTS speech;
+
+		//Speaking lock
+		private static object SpeakingLock = new object();
+		//Current user being spoken
+		private static string SpeakingUser = "";
 
 		private static long currentTime() {
 			return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -37,21 +46,42 @@ namespace SpeechTest {
 				}
 			}
 		}
+		private static int GetTTS(ChatMessage m) {
+			RefreshTimeouts();
+			if (timedout.Keys.Contains(m.Username)) {
+				return -1;
+			}
+			if (config.mutes.Contains(m.Username)) { //TODO: Use UserID
+				return -1;
+			}
+			if (config.maxmsg_len != -1 && m.Message.Length > config.maxmsg_len) {
+				return -1;
+			}
+			if (m.Username == config.twitch_username) {
+				return -1;
+			}
+
+			var formatted = string.Format(config.message_format, m.Username, m.Message, m.Platform);
+			return speech.Prep(formatted);
+		}
 
 		private class ChatMessage {
 			public string Username { get; private set; }
 			public string Message { get; private set; }
 			public string Platform { get; private set; }
-			public ChatMessage(string Username, string Message, string Platform) {
+			public string UserID { get; private set; }
+			public int Player { get; private set; }
+			public ChatMessage(string Username, string Message, string Platform, string UserID="-1") {
 				this.Username = Username;
 				this.Message = Message;
 				this.Platform = Platform;
+				this.UserID = UserID;
+				this.Player = GetTTS(this);
 			}
 		}
 
+		private static TwitchClient client;
 		class Bot {
-			TwitchClient client;
-
 			public Bot() {
 				ConnectionCredentials credentials = new ConnectionCredentials(config.twitch_username.ToLower(), config.oauth);
 				var clientOptions = new ClientOptions {
@@ -74,14 +104,13 @@ namespace SpeechTest {
 
 				client.Connect();
 			}
-
-
+			
 			private void Client_OnUserTimedOut(object sender, OnUserTimedoutArgs e) {
 				timedout.Add(e.UserTimeout.Username, Program.currentTime() + (long)e.UserTimeout.TimeoutDuration);
 
-				if (e.UserTimeout.Username == _currentUser) {
-					if (Monitor.TryEnter(_lock)) { //We are not speaking
-						Monitor.Exit(_lock);
+				if (e.UserTimeout.Username == SpeakingUser) {
+					if (Monitor.TryEnter(SpeakingLock)) { //We are not speaking
+						Monitor.Exit(SpeakingLock);
 					} else { //We are speaking
 						Console.WriteLine("Interrupting TTS...");
 						Thread.CurrentThread.Interrupt();
@@ -90,46 +119,51 @@ namespace SpeechTest {
 			}
 
 			private void Client_OnMessageReceived(object sender, OnMessageReceivedArgs e) {
-				if (e.ChatMessage.Username == "RestreamBot") {
-					Match reg = Regex.Match(e.ChatMessage.Message, "\\[(\\w+): (\\w+)\\] (.+)");
-					if (reg.Success) {
-						string platform = reg.Groups[1].Value;
-						string name = reg.Groups[2].Value;
-						string message = reg.Groups[3].Value;
-						messages.Enqueue(new ChatMessage(name, message, platform));
+				if (e.ChatMessage.Message[0] == '!') {
+					string msg = e.ChatMessage.Message;
+					
+					if (msg.StartsWith("!mute") && (e.ChatMessage.IsBroadcaster || e.ChatMessage.IsModerator)) {
+						string who = msg.Replace("!mute ", "");
+						config.mutes.Add(who);
+						Console.WriteLine($"Muted {who}");
+						ConfigSave("app.json", config);
 					}
 				} else {
-					messages.Enqueue(new ChatMessage(e.ChatMessage.Username, e.ChatMessage.Message, "Twitch"));
+					if (e.ChatMessage.Username == "RestreamBot") {
+						Match reg = Regex.Match(e.ChatMessage.Message, "\\[(\\w+): (\\w+)\\] (.+)");
+						if (reg.Success) {
+							string platform = reg.Groups[1].Value;
+							string name = reg.Groups[2].Value;
+							string message = reg.Groups[3].Value;
+							messages.Enqueue(new ChatMessage(name, message, platform));
+						}
+					} else {
+						messages.Enqueue(new ChatMessage(e.ChatMessage.Username, e.ChatMessage.Message, "Twitch", e.ChatMessage.UserId));
+					}
 				}
 			}
 		}
 		
-		private static object _lock = new object();
-		private static string _currentUser = "";
 		private static void Speech() {
 			while (true) {
 				while (messages.Count > 0) {
 					messages.TryDequeue(out ChatMessage m);
-
-					RefreshTimeouts();
+					
 					if (timedout.Keys.Contains(m.Username)) {
 						continue;
 					}
 					
-					_currentUser = m.Username;
-					lock (_lock) {
-						try {
-							/*if (m.Message.Length > 200) {
-								continue;
-							}*/
-							if (m.Message[0] == '!') {
-								continue;
-							}
+					if (m.Platform == "Twitch" && m.UserID != "-1") {
+						//Special userid specific rules go here
+						//Other platforms are untrusted because we dont know the id
+					}
 
+					SpeakingUser = m.Username;
+					lock (SpeakingLock) {
+						try {
 							Console.WriteLine($"{m.Username} said: {m.Message} from: {m.Platform}");
-							var player = TTS.Speech(string.Format(config.message_format, m.Username, m.Message, m.Platform));
-							if (player != null) {
-								player.Play();
+							if (m.Player != -1) {
+								speech.Speak(m.Player);
 							}
 						} catch (ThreadInterruptedException) {}
 					}
@@ -139,25 +173,46 @@ namespace SpeechTest {
 			}
 		}
 
+		public static void ConfigLoad<T>(string file_path, ref T config) where T : new() {
+			if (!File.Exists(file_path)) {
+				ConfigSave(file_path, config);
+			} else {
+				using (var file = File.OpenRead(file_path))
+				using (var reader = new StreamReader(file)) {
+					config = JsonConvert.DeserializeObject<T>(reader.ReadToEnd());
+				}
+			}
+		}
+		public static void ConfigSave<T>(string file_path, T config) {
+			using (var file = File.Create(file_path))
+			using (var writer = new StreamWriter(file)) {
+				writer.Write(JsonConvert.SerializeObject(config));
+			}
+		}
+
 		static void Main(string[] args) {
 			Console.WriteLine("Started!");
 
-			if (!File.Exists("app.json")) {
-				using (var file = File.Create("app.json"))
-				using (var writer = new StreamWriter(file)) {
-					config = new AppConfig();
-					writer.Write(JsonConvert.SerializeObject(config));
-				}
-				Console.WriteLine("I was unable to find app.json, so i created one!\nPlease edit it to match your channel, oauth, and msgformat");
-			} else {
-				using (var file = File.OpenRead("app.json"))
-				using (var reader = new StreamReader(file)) {
-					config = JsonConvert.DeserializeObject<AppConfig>(reader.ReadToEnd());
-				}
-				
-				Bot bot = new Bot();
-				Speech();
+			ConfigLoad("app.json", ref config);
+			switch (config.tts_name) {
+				case "MaryTTS":
+					Console.WriteLine($"Using TTS: {config.tts_name}");
+					speech = new MaryTTS();
+					break;
+				case "MozillaTTS":
+					Console.WriteLine($"Using TTS: {config.tts_name}");
+					speech = new MozillaTTS();
+					break;
+				case "MSTTS":
+				default:
+					Console.WriteLine($"Using TTS: MSTTS");
+					speech = new MSTTS();
+					break;
 			}
+
+			Bot bot = new Bot();
+			Speech();
+			
 			Console.WriteLine("Stopped!");
 			Console.ReadLine();
 		}
